@@ -33,6 +33,18 @@ class Trainer:
         # set up losses and metrics
         self.rec_loss_func = {key: getattr(loss_module, key)() for key, val in args.rec_loss.items()}
         self.adv_loss = getattr(loss_module, args.gan_type)()
+        
+        # ========== НОВОЕ: Confidence-aware losses для HFI-Gen ==========
+        # Инициализируем confidence losses если они есть в loss module
+        try:
+            self.confidence_reg_loss = getattr(loss_module, 'ConfidenceRegularization')(device=self.device)
+            self.weighted_recon_loss = getattr(loss_module, 'WeightedReconstructionLoss')(device=self.device)
+            print("[INFO] Confidence-aware losses initialized (HFI-Gen mode)")
+        except AttributeError:
+            # Confidence losses не доступны, работаем в совместимом режиме
+            self.confidence_reg_loss = None
+            self.weighted_recon_loss = None
+            print("[INFO] Confidence-aware losses not found (baseline mode)")
 
         # Image generator input: [rgb(3) + mask(1)], discriminator input: [rgb(3)]
         net = importlib.import_module("model." + args.model)
@@ -161,19 +173,43 @@ class Trainer:
                     timer_data.hold()
                     timer_model.tic()
 
-                pred_img = self.netG(images_masked, masks)
+                # ========== FORWARD PASS WITH HYBRID GENERATOR ==========
+                gen_output = self.netG(images_masked, masks)
+                
+                # Поддержка ОБЕИХ архитектур: с confidence branch и без
+                if isinstance(gen_output, tuple):
+                    # Новый HFI-Gen с confidence branch
+                    pred_img, confidence_map = gen_output
+                    has_confidence = True
+                else:
+                    # Оригинальный AOT-GAN без confidence branch
+                    pred_img = gen_output
+                    confidence_map = None
+                    has_confidence = False
+                
                 comp_img = (1 - masks) * images + masks * pred_img
 
-                # reconstruction losses
+                # ========== RECONSTRUCTION LOSSES ==========
                 losses = {}
                 for name, weight in self.args.rec_loss.items():
                     losses[name] = weight * self.rec_loss_func[name](pred_img, images)
 
-                # adversarial loss
+                # ========== CONFIDENCE-AWARE LOSSES (если модель их поддерживает) ==========
+                if has_confidence and self.confidence_reg_loss is not None:
+                    # Confidence regularization: штрафуем модель за неправильную уверенность
+                    conf_reg_loss = self.confidence_reg_loss(confidence_map, masks)
+                    losses["conf_reg"] = conf_reg_loss * getattr(self.args, 'conf_reg_weight', 0.3)
+                    
+                    # Weighted reconstruction loss: взвешиваем по confidence
+                    if self.weighted_recon_loss is not None:
+                        w_recon_loss = self.weighted_recon_loss(pred_img, images, confidence_map, masks)
+                        losses["w_recon"] = w_recon_loss * getattr(self.args, 'w_recon_weight', 0.2)
+
+                # ========== ADVERSARIAL LOSS ==========
                 dis_loss, gen_loss = self.adv_loss(self.netD, comp_img, images, masks)
                 losses["advg"] = gen_loss * self.args.adv_weight
 
-                # backprop
+                # ========== BACKPROPAGATION ==========
                 self.optimG.zero_grad()
                 self.optimD.zero_grad()
                 sum(losses.values()).backward()
@@ -186,7 +222,7 @@ class Trainer:
                     timer_model.hold()
                     timer_data.tic()
 
-                # logs
+                # ========== LOGGING & VISUALIZATION ==========
                 if self.args.global_rank == 0 and (self.iteration % self.args.print_every == 0):
                     pbar.update(self.args.print_every)
                     description = f"mt:{timer_model.release():.1f}s, dt:{timer_data.release():.1f}s, "
@@ -195,13 +231,18 @@ class Trainer:
                         if self.args.tensorboard:
                             self.writer.add_scalar(key, val.item(), self.iteration)
                     pbar.set_description(description)
+                    
                     if self.args.tensorboard:
                         self.writer.add_image("mask", make_grid(masks), self.iteration)
                         self.writer.add_image("orig", make_grid((images + 1.0) / 2.0), self.iteration)
                         self.writer.add_image("pred", make_grid((pred_img + 1.0) / 2.0), self.iteration)
                         self.writer.add_image("comp", make_grid((comp_img + 1.0) / 2.0), self.iteration)
+                        
+                        # Добавить визуализацию confidence map если доступна
+                        if has_confidence and confidence_map is not None:
+                            self.writer.add_image("confidence", make_grid(confidence_map), self.iteration)
 
-                # ===== НОВОЕ: autosave каждые save_every итераций =====
+                # ========== AUTOSAVE ==========
                 if self.args.global_rank == 0 and (self.iteration % self.args.save_every) == 0:
                     self.save()
         

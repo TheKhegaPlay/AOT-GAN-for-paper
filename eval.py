@@ -1,46 +1,85 @@
+"""Evaluate an HFI-GAN checkpoint with PSNR/SSIM on restored images."""
+
+from __future__ import annotations
+
 import argparse
-from glob import glob
-from multiprocessing import Pool
+from pathlib import Path
 
-import numpy as np
-from metric import metric as module_metric
-from PIL import Image
-from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader
 
-
-parser = argparse.ArgumentParser(description="Image Inpainting")
-parser.add_argument("--real_dir", required=True, type=str)
-parser.add_argument("--fake_dir", required=True, type=str)
-parser.add_argument("--metric", type=str, nargs="+")
-args = parser.parse_args()
+from datasets import ForensicInpaintingDataset
+from models import HybridForensicGenerator
+from models.losses import masked_l1, psnr, ssim
 
 
-def read_img(name_pair):
-    rname, fname = name_pair
-    rimg = Image.open(rname)
-    fimg = Image.open(fname)
-    return np.array(rimg), np.array(fimg)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a trained HFI-GAN checkpoint")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--image-dir", type=Path, required=True)
+    parser.add_argument("--mask-dir", type=Path, required=True)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--validation-fraction", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--lpips", action="store_true", help="also compute LPIPS if installed")
+    return parser.parse_args()
 
 
-def main(num_worker=8):
-    real_names = sorted(glob(f"{args.real_dir}/*.png"))
-    fake_names = sorted(glob(f"{args.fake_dir}/*.png"))
-    print(f"real images: {len(real_names)}, fake images: {len(fake_names)}")
-    real_images = []
-    fake_images = []
-    pool = Pool(num_worker)
-    for rimg, fimg in tqdm(
-        pool.imap_unordered(read_img, zip(real_names, fake_names)), total=len(real_names), desc="loading images"
-    ):
-        real_images.append(rimg)
-        fake_images.append(fimg)
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = checkpoint.get("config", {})
+    image_size = args.image_size or int(config.get("image_size", 256))
+    model = HybridForensicGenerator(
+        base_channels=int(config.get("base_channels", 48)),
+        cab_count=int(config.get("cab_count", 6)),
+    ).to(device)
+    model.load_state_dict(checkpoint["generator"])
+    model.eval()
 
-    # metrics prepare for image assesments
-    metrics = {met: getattr(module_metric, met) for met in args.metric}
-    evaluation_scores = {key: 0 for key, val in metrics.items()}
-    for key, val in metrics.items():
-        evaluation_scores[key] = val(real_images, fake_images, num_worker=num_worker)
-    print(" ".join(["{}: {:6f},".format(key, val) for key, val in evaluation_scores.items()]))
+    dataset = ForensicInpaintingDataset(
+        args.image_dir, args.mask_dir, split="val", image_size=image_size,
+        validation_fraction=args.validation_fraction, seed=args.seed,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+    )
+    lpips_metric = None
+    if args.lpips:
+        try:
+            import lpips
+        except ImportError as exc:
+            raise RuntimeError("Install the optional dependency with: pip install lpips") from exc
+        lpips_metric = lpips.LPIPS(net="alex").to(device).eval()
+
+    full_psnr: list[float] = []
+    full_ssim: list[float] = []
+    damaged_l1: list[float] = []
+    lpips_values: list[float] = []
+    with torch.inference_mode():
+        for masked, mask, target in loader:
+            masked, mask, target = masked.to(device), mask.to(device), target.to(device)
+            prediction = model(masked, mask)
+            completed = prediction * mask + target * (1.0 - mask)
+            full_psnr.append(psnr(completed, target).item())
+            full_ssim.append(ssim(completed, target).item())
+            damaged_l1.append(masked_l1(prediction, target, mask).item())
+            if lpips_metric is not None:
+                lpips_values.append(lpips_metric(completed, target).mean().item())
+
+    print(f"Images evaluated: {len(dataset)}")
+    print(f"PSNR (full image): {sum(full_psnr) / len(full_psnr):.4f} dB")
+    print(f"SSIM (full image): {sum(full_ssim) / len(full_ssim):.6f}")
+    print(f"L1 (damaged regions): {sum(damaged_l1) / len(damaged_l1):.6f}")
+    if lpips_values:
+        print(f"LPIPS: {sum(lpips_values) / len(lpips_values):.6f}")
 
 
 if __name__ == "__main__":

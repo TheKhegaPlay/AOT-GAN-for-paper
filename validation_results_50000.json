@@ -1,0 +1,39 @@
+{
+  "evaluated_at_utc": "2026-10-20T20:38:23.398812+00:00",
+  "checkpoint": "checkpoints/hfi_gan/hfi_gan_final.pt",
+  "checkpoint_sha256": "1db62a7b5c40d1bf1cf7c143a34bbe3930dc8818fe5f58b8554c8caf1b556987",
+  "checkpoint_iteration": 50000,
+  "model": {
+    "name": "HFI-GAN",
+    "base_channels": 48,
+    "cab_count": 6
+  },
+  "dataset": {
+    "name": "Places365 Standard",
+    "image_size": 256,
+    "validation_fraction": 0.05,
+    "validation_seed": 2026,
+    "validation_split_images": 90173,
+    "image_manifest": "places365_images.txt",
+    "mask_directory": "masks_single_blob_4_12",
+    "eligible_masks": 2000,
+    "mask_coverage_range": [
+      0.05,
+      0.2
+    ]
+  },
+  "protocol": {
+    "evaluated_images": 16,
+    "batch_size": 4,
+    "batches": 4,
+    "max_batches": 4,
+    "subset": true,
+    "metrics_aggregation": "arithmetic mean of batch means",
+    "compositing": "ground truth outside mask; model prediction inside mask"
+  },
+  "metrics": {
+    "full_image_psnr_db": 33.21689510345459,
+    "full_image_ssim": 0.9730660021305084,
+    "damaged_region_l1": 0.13753927685320377
+  }
+}
